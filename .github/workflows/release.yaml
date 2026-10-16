@@ -63,16 +63,11 @@ jobs:
             -f tag_name="$GITHUB_REF_NAME" \
             --jq .body > "$generated_notes_file"
 
-          # 若自动生成的 release notes 过长，截断以避免 GitHub API 的长度限制
-          max_bytes=1200
-          if [[ -s "$generated_notes_file" && $(wc -c <"$generated_notes_file") -gt $max_bytes ]]; then
-            echo "Generated release notes too long ($(wc -c <\"$generated_notes_file\") bytes), truncating to ${max_bytes} bytes" >&2
-            head -c "$max_bytes" "$generated_notes_file" > "${generated_notes_file}.trunc"
-            if [[ -n "$previous_tag" ]]; then
-              printf "\n\n**(truncated)** Full changelog: https://github.com/%s/compare/%s...%s\n" "$GH_REPO" "$previous_tag" "$GITHUB_REF_NAME" >> "${generated_notes_file}.trunc"
-            else
-              printf "\n\n**(truncated)** Full changelog: https://github.com/%s/commits/%s\n" "$GH_REPO" "$GITHUB_REF_NAME" >> "${generated_notes_file}.trunc"
-            fi
+          # 如果自动生成的 notes 很大，先做一次较宽松的截断（保险）
+          gen_max=100000
+          if [[ -s "$generated_notes_file" && $(wc -c <"$generated_notes_file") -gt $gen_max ]]; then
+            echo "Generated notes too long ($(wc -c <\"$generated_notes_file\") bytes), truncating to ${gen_max} bytes" >&2
+            head -c "$gen_max" "$generated_notes_file" > "${generated_notes_file}.trunc"
             mv "${generated_notes_file}.trunc" "$generated_notes_file"
           fi
 
@@ -98,6 +93,35 @@ jobs:
             printf '\n'
             cat "$changelog_notes_file"
           } > "$updated_notes_file"
+
+          # 最终截断保护：确保最终的 release body 不超过 max_bytes（严格限制）
+          max_bytes=1200
+          # 构造追加的后缀（指向完整 changelog），用于替换被截断的部分
+          if [[ -n "$previous_tag" ]]; then
+            suffix="$(printf '\n\n**(truncated)** Full changelog: https://github.com/%s/compare/%s...%s\n' "$GH_REPO" "$previous_tag" "$GITHUB_REF_NAME")"
+          else
+            suffix="$(printf '\n\n**(truncated)** Full changelog: https://github.com/%s/commits/%s\n' "$GH_REPO" "$GITHUB_REF_NAME")"
+          fi
+          suffix_bytes=$(printf "%s" "$suffix" | wc -c)
+
+          current_bytes=$(wc -c <"$updated_notes_file")
+          if [[ $current_bytes -gt $max_bytes ]]; then
+            # 如果后缀本身就超过限制，使用一个非常短的替代后缀
+            if [[ $suffix_bytes -ge $max_bytes ]]; then
+              suffix=$'\n\n**(truncated)**\n'
+              suffix_bytes=$(printf "%s" "$suffix" | wc -c)
+            fi
+            keep_bytes=$((max_bytes - suffix_bytes))
+            if [[ $keep_bytes -le 0 ]]; then
+              # 极端回退：只写后缀（保证不超限）
+              printf "%s" "$suffix" > "${updated_notes_file}.trunc"
+            else
+              head -c "$keep_bytes" "$updated_notes_file" > "${updated_notes_file}.trunc"
+              printf "%s" "$suffix" >> "${updated_notes_file}.trunc"
+            fi
+            mv "${updated_notes_file}.trunc" "$updated_notes_file"
+            echo "Truncated updated release notes to ${max_bytes} bytes" >&2
+          fi
 
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file "$updated_notes_file"
@@ -382,126 +406,6 @@ jobs:
             fi
           )
           gh release upload "$GITHUB_REF_NAME" "$tmp_dir/checksums.txt" --clobber
-
-  # Commented out: build-linux-no-plugin per request to drop _no-plugin builds
-  # build-linux-no-plugin:
-  #   name: build linux-${{ matrix.goarch }} no-plugin
-  #   needs: prepare-release
-  #   runs-on: ubuntu-latest
-  #   strategy:
-  #     fail-fast: false
-  #     matrix:
-  #       include:
-  #         - target: linux-amd64-no-plugin
-  #           goarch: amd64
-  #           asset_arch: amd64
-  #         - target: linux-arm64-no-plugin
-  #           goarch: arm64
-  #           asset_arch: aarch64
-  #   steps:
-  #     - uses: actions/checkout@v6
-  #       with:
-  #         fetch-depth: 0
-  #     - uses: actions/setup-go@v6
-  #       with:
-  #         go-version: ${{ env.GO_VERSION }}
-  #         cache: true
-  #     - name: Refresh models catalog
-  #       shell: bash
-  #       run: bash .github/scripts/refresh-model-catalogs.sh
-  #     - name: Fetch tags
-  #       shell: bash
-  #       run: git fetch --force --tags
-  #     - uses: actions/cache@v4
-  #       with:
-  #         path: |
-  #           ~/.cache/go-build
-  #           ~/go/pkg/mod
-  #         key: go-linux-no-plugin-${{ matrix.goarch }}-${{ hashFiles('go.sum') }}
-  #         restore-keys: |
-  #           go-linux-no-plugin-${{ matrix.goarch }}-
-  #           go-linux-no-plugin-
-  #     - name: Generate Build Metadata
-  #       shell: bash
-  #       run: |
-  #         set -euo pipefail
-  #         echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
-  #         echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
-  #         echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
-  #     - name: Build archive
-  #       shell: bash
-  #       env:
-  #         TARGET: ${{ matrix.target }}
-  #         GOARCH: ${{ matrix.goarch }}
-  #         ASSET_ARCH: ${{ matrix.asset_arch }}
-  #       run: |
-  #         set -euo pipefail
-  #
-  #         archive_dir="dist/${TARGET}/archive"
-  #         archive_name="CLIProxyAPI_${RELEASE_VERSION}_linux_${ASSET_ARCH}_no-plugin.tar.gz"
-  #         rm -rf "dist/${TARGET}"
-  #         mkdir -p "$archive_dir"
-  #
-  #         CGO_ENABLED=0 GOOS=linux GOARCH="$GOARCH" go build -buildvcs=false \
-  #           -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
-  #           -o "$archive_dir/cli-proxy-api" ./cmd/server/
-  #
-  #         if readelf -l "$archive_dir/cli-proxy-api" | grep -q 'Requesting program interpreter'; then
-  #           readelf -l "$archive_dir/cli-proxy-api" >&2
-  #           echo "no-plugin linux binary must not require a dynamic interpreter" >&2
-  #           exit 1
-  #         fi
-  #
-  #         cp LICENSE README.md README_CN.md config.example.yaml "$archive_dir/"
-  #         tar -C "$archive_dir" -czf "dist/$archive_name" cli-proxy-api LICENSE README.md README_CN.md config.example.yaml
-  #     - uses: actions/upload-artifact@v4
-  #       with:
-  #         name: ${{ matrix.target }}
-  #         path: dist/CLIProxyAPI_*
-  #         if-no-files-found: error
-  #     - name: Upload release assets
-  #       shell: bash
-  #       env:
-  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  #       run: |
-  #         set -euo pipefail
-  #         shopt -s nullglob
-  #         assets=(dist/CLIProxyAPI_*.tar.gz)
-  #         if [[ ${#assets[@]} -eq 0 ]]; then
-  #           printf 'expected archive assets, found %s\n' "${#assets[@]}" >&2
-  #           printf '%s\n' "${assets[@]}" >&2
-  #           exit 1
-  #         fi
-  #         gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
-  #     - name: Refresh release checksums
-  #       continue-on-error: true
-  #       shell: bash
-  #       env:
-  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  #       run: |
-  #         set -euo pipefail
-  #         tmp_dir="$(mktemp -d)"
-  #         trap 'rm -rf "$tmp_dir"' EXIT
-  #         gh release download "$GITHUB_REF_NAME" \
-  #           --pattern 'CLIProxyAPI_*.tar.gz' \
-  #           --pattern 'CLIProxyAPI_*.zip' \
-  #           --dir "$tmp_dir" \
-  #           --clobber
-  #         (
-  #           cd "$tmp_dir"
-  #           shopt -s nullglob
-  #           archives=(CLIProxyAPI_*.tar.gz CLIProxyAPI_*.zip)
-  #           if [[ ${#archives[@]} -eq 0 ]]; then
-  #             echo "No release archives found"
-  #             exit 0
-  #           fi
-  #           if command -v sha256sum >/dev/null 2>&1; then
-  #             sha256sum "${archives[@]}" | sort -k2 > checksums.txt
-  #           else
-  #             shasum -a 256 "${archives[@]}" | sort -k2 > checksums.txt
-  #           fi
-  #         )
-  #         gh release upload "$GITHUB_REF_NAME" "$tmp_dir/checksums.txt" --clobber
 
   # New job: build for armv7 (rpi2 v1.1)
   build-linux-armv7:
