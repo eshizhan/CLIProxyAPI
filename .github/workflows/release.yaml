@@ -243,10 +243,7 @@ jobs:
             # 在 sysroot 中写入 apt 配置，指向 archive.debian.org，并禁用 valid-until 检查
             sudo mkdir -p "${SYSROOT}/etc/apt/apt.conf.d"
             echo 'Acquire::Check-Valid-Until "false";' | sudo tee "${SYSROOT}/etc/apt/apt.conf.d/99no-check-valid-until" >/dev/null
-            cat <<'EOF' | sudo tee "${SYSROOT}/etc/apt/sources.list" >/dev/null
-deb http://archive.debian.org/debian stretch main
-deb http://archive.debian.org/debian-security stretch/updates main
-EOF
+            printf '%s\n' "deb http://archive.debian.org/debian stretch main" "deb http://archive.debian.org/debian-security stretch/updates main" | sudo tee "${SYSROOT}/etc/apt/sources.list" >/dev/null
 
             # run debootstrap second-stage inside chroot (using qemu)
             sudo chroot "${SYSROOT}" /usr/bin/qemu-arm-static /bin/bash -c "
