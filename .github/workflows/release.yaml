@@ -221,10 +221,9 @@ jobs:
                 fi
               '
           else
-            # Runner 上：使用 debootstrap 从 archive.debian.org 构建 stretch (armhf) sysroot，然后用交叉编译器并指定 --sysroot 链接 glibc 2.24
+            # Runner 上：使用 debootstrap 从 archive.debian.org 构建 stretch (armhf) sysroot，然后在 chroot 内安装开发包（重试并在失败时打印日志）
             echo "Building for ${GOARCH} using Debian stretch (armhf) sysroot built from archive.debian.org"
             
-            # 安装需要的工具：debootstrap, qemu-user-static, cross toolchain
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends debootstrap qemu-user-static binfmt-support \
               gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf
@@ -233,37 +232,70 @@ jobs:
             sudo rm -rf "${SYSROOT}"
             sudo mkdir -p "${SYSROOT}"
             
-            # 使用官方 archive.debian.org 通过 debootstrap 创建最小 rootfs （foreign 模式）
             DEBOOTSTRAP_URL="http://archive.debian.org/debian"
             sudo debootstrap --arch=armhf --foreign --variant=minbase stretch "${SYSROOT}" "${DEBOOTSTRAP_URL}"
             
-            # 复制 qemu-user-static 以便在 chroot 内运行 second-stage
+            # copy qemu so we can run second-stage in chroot
             sudo cp /usr/bin/qemu-arm-static "${SYSROOT}/usr/bin/"
             
-            # 在 sysroot 中写入 apt 配置，指向 archive.debian.org，并禁用 valid-until 检查
+            # configure apt inside sysroot to use archive and ignore Valid-Until
             sudo mkdir -p "${SYSROOT}/etc/apt/apt.conf.d"
             echo 'Acquire::Check-Valid-Until "false";' | sudo tee "${SYSROOT}/etc/apt/apt.conf.d/99no-check-valid-until" >/dev/null
             printf '%s\n' "deb http://archive.debian.org/debian stretch main" "deb http://archive.debian.org/debian-security stretch/updates main" | sudo tee "${SYSROOT}/etc/apt/sources.list" >/dev/null
             
-            # run debootstrap second-stage inside chroot (using qemu), then install dev packages inside chroot
+            # run second-stage then install dev packages inside chroot with retries; fail loudly and print apt logs if something goes wrong
             sudo chroot "${SYSROOT}" /usr/bin/qemu-arm-static /bin/bash -c "
               set -euo pipefail
-              rm -f /var/lib/apt/lists/* || true
-              apt-get -o Acquire::Check-Valid-Until=false update || true
-              /debootstrap/debootstrap --second-stage || true
             
-              # 安装必要的开发包（包括 libc6-dev, build-essential 等），为 CGO 编译提供头文件和静态链接库
-              apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends \
-                build-essential libc6-dev pkg-config ca-certificates || true
+              # remove any stale lists
+              rm -rf /var/lib/apt/lists/* || true
             
-              # 清理 apt lists 以减小体积
+              # retry helper
+              run_retry() {
+                local cmd=\"\$*\"
+                local i
+                for i in 1 2 3; do
+                  if eval \"\$cmd\"; then
+                    return 0
+                  fi
+                  echo \"Command failed (attempt \$i): \$cmd\" >&2
+                  sleep \$((i * 2))
+                done
+                return 1
+              }
+            
+              # update and complete debootstrap second-stage
+              run_retry apt-get -o Acquire::Check-Valid-Until=false update
+              run_retry /debootstrap/debootstrap --second-stage
+            
+              # install dev packages needed for CGO (headers, pthread, etc.)
+              run_retry apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends \
+                build-essential libc6-dev pkg-config ca-certificates
+            
+              # sanity check: ensure key headers exist
+              missing=0
+              for h in stdlib.h stdint.h stdio.h pthread.h errno.h; do
+                if [[ ! -f /usr/include/\$h && ! -f /usr/include/\$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null)/\$h ]]; then
+                  echo \"MISSING header: /usr/include/\$h\" >&2
+                  missing=1
+                fi
+              done
+            
+              if [[ \$missing -ne 0 ]]; then
+                echo \"*** Sysroot missing required headers; dumping apt logs and exiting ***\" >&2
+                ls -R /var/lib/apt/lists || true
+                tail -n +1 /var/log/apt/* || true
+                exit 2
+              fi
+            
+              # clean apt lists to keep sysroot small
               rm -rf /var/lib/apt/lists/* || true
             "
             
-            # 确保 sysroot 可读
+            # ensure sysroot readable
             sudo chmod -R a+rX "${SYSROOT}"
             
-            # set cross compiler to use this sysroot
+            # export cross-compiler env pointing to sysroot and build
             export CC="arm-linux-gnueabihf-gcc --sysroot=${SYSROOT}"
             export CXX="arm-linux-gnueabihf-g++ --sysroot=${SYSROOT}"
             export CGO_ENABLED=1
@@ -273,16 +305,14 @@ jobs:
             export CGO_CFLAGS="--sysroot=${SYSROOT}"
             export CGO_LDFLAGS="--sysroot=${SYSROOT} -L${SYSROOT}/lib -L${SYSROOT}/usr/lib"
             
-            # Build with go
             CGO_ENABLED=1 GOOS=linux GOARCH="${GOARCH}" GOARM=7 \
               go build -buildvcs=false \
                 -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
                 -o "$archive_dir/cli-proxy-api" ./cmd/server/
             
-            # 输出二进制需要的 GLIBC 符号以便检查（期望不高于 2.24）
             if command -v readelf >/dev/null 2>&1; then
               echo "Required GLIBC symbols (from built binary):"
-              readelf --version-info "$archive_dir/cli-proxy-api" | sed -n "s/.*Name: GLIBC_\\([0-9.]*\\).*/GLIBC_\\1/p" | sort -Vu || true
+              readelf --version-info "$archive_dir/cli-proxy-api" | sed -n 's/.*Name: GLIBC_\([0-9.]*\).*/GLIBC_\1/p' | sort -Vu || true
             fi
           fi
 
