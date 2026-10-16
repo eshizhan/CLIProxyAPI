@@ -94,7 +94,7 @@ jobs:
             cat "$changelog_notes_file"
           } > "$updated_notes_file"
 
-          # 最终截断保护，确保最终 release body 不超过 max_bytes（严格）
+          # 最终截断保护，确保最终 release body 不超过 max_bytes
           max_bytes=1200
           if [[ -n "$previous_tag" ]]; then
             suffix="$(printf '\n\n**(truncated)** Full changelog: https://github.com/%s/compare/%s...%s\n' "$GH_REPO" "$previous_tag" "$GITHUB_REF_NAME")"
@@ -151,7 +151,7 @@ jobs:
             runner: ubuntu-latest
             goarch: arm
             asset_arch: armv7
-            manylinux_image: ''    # empty -> use Debian Stretch arm container build (arm32v7/debian:stretch)
+            manylinux_image: ''    # empty -> 不使用 manylinux docker，改为在 runner 上用 debootstrap + cross 编译（Debian stretch sysroot）
     steps:
       - uses: actions/checkout@v6
         with:
@@ -166,12 +166,6 @@ jobs:
       - name: Fetch tags
         shell: bash
         run: git fetch --force --tags
-
-      # Setup QEMU only when building armv7 via container emulation
-      - name: Setup QEMU emulation
-        if: matrix.goarch == 'arm'
-        uses: docker/setup-qemu-action@v2
-
       - name: Generate Build Metadata
         shell: bash
         run: |
@@ -179,7 +173,6 @@ jobs:
           echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
           echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
-
       - name: Build archive
         shell: bash
         env:
@@ -196,7 +189,7 @@ jobs:
           mkdir -p "$archive_dir"
 
           if [[ -n "${MANYLINUX_IMAGE}" ]]; then
-            # manylinux docker 构建（unchanged）
+            # manylinux docker 构建（原逻辑）
             docker run --rm \
               -v "$PWD:/src" \
               -w /src \
@@ -228,58 +221,75 @@ jobs:
                 fi
               '
           else
-            # Build inside an official Debian Stretch armv7 container (emulated via QEMU).
-            # This ensures the produced binary links against glibc 2.24 (Debian 9 / stretch).
-            echo "Building for ${GOARCH} using arm32v7/debian:stretch (via --platform=linux/arm/v7)"
+            # Runner 上：使用 debootstrap 从 archive.debian.org 构建 stretch (armhf) sysroot，然后用交叉编译器并指定 --sysroot 链接 glibc 2.24
+            echo "Building for ${GOARCH} using Debian stretch (armhf) sysroot built from archive.debian.org"
 
-            docker run --rm --platform=linux/arm/v7 \
-              -v "$PWD:/src" -w /src \
-              -e GO_VERSION -e RELEASE_VERSION -e COMMIT -e BUILD_DATE \
-              arm32v7/debian:stretch \
-              bash -euo pipefail -c '
-                set -eux
-                apt-get update
-                apt-get install -y --no-install-recommends gcc build-essential curl ca-certificates binutils
-                # Try Go tarballs for 32-bit ARM
-                candidates=( "go${GO_VERSION}.linux-arm.tar.gz" "go${GO_VERSION}.linux-armv6l.tar.gz" )
-                found=0
-                for go_archive in "${candidates[@]}"; do
-                  echo "Trying download: ${go_archive}"
-                  if curl -fsSL "https://go.dev/dl/${go_archive}" -o "/tmp/${go_archive}"; then
-                    found=1
-                    break
-                  fi
-                done
-                if [[ $found -ne 1 ]]; then
-                  echo "Failed to download Go tarball for ARM" >&2
-                  exit 1
-                fi
-                rm -rf /usr/local/go
-                tar -C /usr/local -xzf "/tmp/${go_archive}"
-                export PATH="/usr/local/go/bin:${PATH}"
+            # 安装需要的工具：debootstrap, qemu-user-static, cross toolchain
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends debootstrap qemu-user-static binfmt-support \
+              gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf
 
-                # Build with CGO enabled targeting armv7
-                CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 \
-                  go build -buildvcs=false \
-                    -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
-                    -o "'"$archive_dir"'/cli-proxy-api" ./cmd/server/
+            SYSROOT="/tmp/stretch-sysroot"
+            sudo rm -rf "${SYSROOT}"
+            sudo mkdir -p "${SYSROOT}"
 
-                # Print GLIBC symbols required by the built binary (for verification)
-                if command -v readelf >/dev/null 2>&1; then
-                  readelf --version-info "'"$archive_dir"'/cli-proxy-api" | sed -n "s/.*Name: GLIBC_\\([0-9.]*\\).*/GLIBC_\\1/p" | sort -Vu || true
-                fi
-              '
+            # 使用官方 archive.debian.org 通过 debootstrap 创建最小 rootfs （foreign 模式）
+            DEBOOTSTRAP_URL="http://archive.debian.org/debian"
+            sudo debootstrap --arch=armhf --foreign --variant=minbase stretch "${SYSROOT}" "${DEBOOTSTRAP_URL}"
+
+            # 复制 qemu-user-static 以便在 chroot 内运行 second-stage
+            sudo cp /usr/bin/qemu-arm-static "${SYSROOT}/usr/bin/"
+
+            # 在 sysroot 中写入 apt 配置，指向 archive.debian.org，并禁用 valid-until 检查
+            sudo mkdir -p "${SYSROOT}/etc/apt/apt.conf.d"
+            echo 'Acquire::Check-Valid-Until "false";' | sudo tee "${SYSROOT}/etc/apt/apt.conf.d/99no-check-valid-until" >/dev/null
+            cat <<'EOF' | sudo tee "${SYSROOT}/etc/apt/sources.list" >/dev/null
+deb http://archive.debian.org/debian stretch main
+deb http://archive.debian.org/debian-security stretch/updates main
+EOF
+
+            # run debootstrap second-stage inside chroot (using qemu)
+            sudo chroot "${SYSROOT}" /usr/bin/qemu-arm-static /bin/bash -c "
+              set -euo pipefail
+              rm -f /var/lib/apt/lists/* || true
+              apt-get -o Acquire::Check-Valid-Until=false update || true
+              /debootstrap/debootstrap --second-stage || true
+              apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends ca-certificates || true
+            "
+
+            # sysroot ready. make it readable
+            sudo chmod -R a+rX "${SYSROOT}"
+
+            # set cross compiler to use this sysroot
+            export CC="arm-linux-gnueabihf-gcc --sysroot=${SYSROOT}"
+            export CXX="arm-linux-gnueabihf-g++ --sysroot=${SYSROOT}"
+            export CGO_ENABLED=1
+            export GOOS=linux
+            export GOARCH="${GOARCH}"
+            export GOARM=7
+            export CGO_CFLAGS="--sysroot=${SYSROOT}"
+            export CGO_LDFLAGS="--sysroot=${SYSROOT} -L${SYSROOT}/lib -L${SYSROOT}/usr/lib"
+
+            # Build with go
+            CGO_ENABLED=1 GOOS=linux GOARCH="${GOARCH}" GOARM=7 \
+              go build -buildvcs=false \
+                -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
+                -o "$archive_dir/cli-proxy-api" ./cmd/server/
+
+            # 输出二进制需要的 GLIBC 符号以便检查（期望不高于 2.24）
+            if command -v readelf >/dev/null 2>&1; then
+              echo "Required GLIBC symbols (from built binary):"
+              readelf --version-info "$archive_dir/cli-proxy-api" | sed -n "s/.*Name: GLIBC_\\([0-9.]*\\).*/GLIBC_\\1/p" | sort -Vu || true
+            fi
           fi
 
           cp LICENSE README.md README_CN.md config.example.yaml "$archive_dir/"
           tar -C "$archive_dir" -czf "dist/$archive_name" cli-proxy-api LICENSE README.md README_CN.md config.example.yaml
-
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: dist/CLIProxyAPI_*
           if-no-files-found: error
-
       - name: Upload release assets
         shell: bash
         env:
@@ -294,7 +304,6 @@ jobs:
             exit 1
           fi
           gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
-
       - name: Refresh release checksums
         continue-on-error: true
         shell: bash
@@ -325,9 +334,11 @@ jobs:
           )
           gh release upload "$GITHUB_REF_NAME" "$tmp_dir/checksums.txt" --clobber
 
-  # Commented out: build-linux-no-plugin (omitted)
+  # Commented out: build-linux-no-plugin per request to drop _no-plugin builds
+  # ... (omitted)
 
-  # Commented out: build-freebsd (omitted)
+  # Commented out: build-freebsd per request to keep only Linux builds
+  # ... (omitted)
 
   publish-checksums:
     runs-on: ubuntu-latest
