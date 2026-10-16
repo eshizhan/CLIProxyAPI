@@ -223,40 +223,46 @@ jobs:
           else
             # Runner 上：使用 debootstrap 从 archive.debian.org 构建 stretch (armhf) sysroot，然后用交叉编译器并指定 --sysroot 链接 glibc 2.24
             echo "Building for ${GOARCH} using Debian stretch (armhf) sysroot built from archive.debian.org"
-
+            
             # 安装需要的工具：debootstrap, qemu-user-static, cross toolchain
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends debootstrap qemu-user-static binfmt-support \
               gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf
-
+            
             SYSROOT="/tmp/stretch-sysroot"
             sudo rm -rf "${SYSROOT}"
             sudo mkdir -p "${SYSROOT}"
-
+            
             # 使用官方 archive.debian.org 通过 debootstrap 创建最小 rootfs （foreign 模式）
             DEBOOTSTRAP_URL="http://archive.debian.org/debian"
             sudo debootstrap --arch=armhf --foreign --variant=minbase stretch "${SYSROOT}" "${DEBOOTSTRAP_URL}"
-
+            
             # 复制 qemu-user-static 以便在 chroot 内运行 second-stage
             sudo cp /usr/bin/qemu-arm-static "${SYSROOT}/usr/bin/"
-
+            
             # 在 sysroot 中写入 apt 配置，指向 archive.debian.org，并禁用 valid-until 检查
             sudo mkdir -p "${SYSROOT}/etc/apt/apt.conf.d"
             echo 'Acquire::Check-Valid-Until "false";' | sudo tee "${SYSROOT}/etc/apt/apt.conf.d/99no-check-valid-until" >/dev/null
             printf '%s\n' "deb http://archive.debian.org/debian stretch main" "deb http://archive.debian.org/debian-security stretch/updates main" | sudo tee "${SYSROOT}/etc/apt/sources.list" >/dev/null
-
-            # run debootstrap second-stage inside chroot (using qemu)
+            
+            # run debootstrap second-stage inside chroot (using qemu), then install dev packages inside chroot
             sudo chroot "${SYSROOT}" /usr/bin/qemu-arm-static /bin/bash -c "
               set -euo pipefail
               rm -f /var/lib/apt/lists/* || true
               apt-get -o Acquire::Check-Valid-Until=false update || true
               /debootstrap/debootstrap --second-stage || true
-              apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends ca-certificates || true
+            
+              # 安装必要的开发包（包括 libc6-dev, build-essential 等），为 CGO 编译提供头文件和静态链接库
+              apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends \
+                build-essential libc6-dev pkg-config ca-certificates || true
+            
+              # 清理 apt lists 以减小体积
+              rm -rf /var/lib/apt/lists/* || true
             "
-
-            # sysroot ready. make it readable
+            
+            # 确保 sysroot 可读
             sudo chmod -R a+rX "${SYSROOT}"
-
+            
             # set cross compiler to use this sysroot
             export CC="arm-linux-gnueabihf-gcc --sysroot=${SYSROOT}"
             export CXX="arm-linux-gnueabihf-g++ --sysroot=${SYSROOT}"
@@ -266,13 +272,13 @@ jobs:
             export GOARM=7
             export CGO_CFLAGS="--sysroot=${SYSROOT}"
             export CGO_LDFLAGS="--sysroot=${SYSROOT} -L${SYSROOT}/lib -L${SYSROOT}/usr/lib"
-
+            
             # Build with go
             CGO_ENABLED=1 GOOS=linux GOARCH="${GOARCH}" GOARM=7 \
               go build -buildvcs=false \
                 -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
                 -o "$archive_dir/cli-proxy-api" ./cmd/server/
-
+            
             # 输出二进制需要的 GLIBC 符号以便检查（期望不高于 2.24）
             if command -v readelf >/dev/null 2>&1; then
               echo "Required GLIBC symbols (from built binary):"
