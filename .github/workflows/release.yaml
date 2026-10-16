@@ -221,35 +221,46 @@ jobs:
                 fi
               '
           else
-            # Runner 上：使用 debootstrap 从 archive.debian.org 构建 stretch (armhf) sysroot，然后在 chroot 内安装开发包（重试并在失败时打印日志）
+            # Runner 上：使用 debootstrap 从 archive.debian.org 构建 stretch (armhf) sysroot，然后用交叉编译器并指定 --sysroot 链接 glibc 2.24
             echo "Building for ${GOARCH} using Debian stretch (armhf) sysroot built from archive.debian.org"
-            
+
+            # 安装需要的工具：debootstrap, qemu-user-static, cross toolchain
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends debootstrap qemu-user-static binfmt-support \
               gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf
-            
+
             SYSROOT="/tmp/stretch-sysroot"
             sudo rm -rf "${SYSROOT}"
             sudo mkdir -p "${SYSROOT}"
-            
+
+            # 使用官方 archive.debian.org 通过 debootstrap 创建最小 rootfs （foreign 模式）
             DEBOOTSTRAP_URL="http://archive.debian.org/debian"
             sudo debootstrap --arch=armhf --foreign --variant=minbase stretch "${SYSROOT}" "${DEBOOTSTRAP_URL}"
-            
-            # copy qemu so we can run second-stage in chroot
-            sudo cp /usr/bin/qemu-arm-static "${SYSROOT}/usr/bin/"
-            
-            # configure apt inside sysroot to use archive and ignore Valid-Until
+
+            # 复制 qemu-user-static 以便在 chroot 内运行 second-stage
+            sudo cp /usr/bin/qemu-arm-static "${SYSROOT}/usr/bin/" || true
+
+            # 在 sysroot 中写入 apt 配置，指向 archive.debian.org，并禁用 valid-until 检查
             sudo mkdir -p "${SYSROOT}/etc/apt/apt.conf.d"
             echo 'Acquire::Check-Valid-Until "false";' | sudo tee "${SYSROOT}/etc/apt/apt.conf.d/99no-check-valid-until" >/dev/null
             printf '%s\n' "deb http://archive.debian.org/debian stretch main" "deb http://archive.debian.org/debian-security stretch/updates main" | sudo tee "${SYSROOT}/etc/apt/sources.list" >/dev/null
-            
-            # run second-stage then install dev packages inside chroot with retries; fail loudly and print apt logs if something goes wrong
+
+            # bind-mount pseudo-filesystems for chroot
+            sudo mount --bind /proc "${SYSROOT}/proc" || true
+            sudo mount --bind /sys "${SYSROOT}/sys" || true
+            sudo mount --bind /dev "${SYSROOT}/dev" || true
+            sudo mount --bind /dev/pts "${SYSROOT}/dev/pts" || true
+
+            # run debootstrap second-stage inside chroot (using qemu), then install dev packages inside chroot with retries; fail loudly and print apt logs if something goes wrong
             sudo chroot "${SYSROOT}" /usr/bin/qemu-arm-static /bin/bash -c "
               set -euo pipefail
-            
+
               # remove any stale lists
               rm -rf /var/lib/apt/lists/* || true
-            
+
+              echo 'Running debootstrap second-stage...'
+              /debootstrap/debootstrap --second-stage
+
               # retry helper
               run_retry() {
                 local cmd=\"\$*\"
@@ -263,15 +274,12 @@ jobs:
                 done
                 return 1
               }
-            
-              # update and complete debootstrap second-stage
+
+              # update and install dev packages needed for CGO (headers, pthread, etc.)
               run_retry apt-get -o Acquire::Check-Valid-Until=false update
-              run_retry /debootstrap/debootstrap --second-stage
-            
-              # install dev packages needed for CGO (headers, pthread, etc.)
               run_retry apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends \
                 build-essential libc6-dev pkg-config ca-certificates
-            
+
               # sanity check: ensure key headers exist
               missing=0
               for h in stdlib.h stdint.h stdio.h pthread.h errno.h; do
@@ -280,22 +288,28 @@ jobs:
                   missing=1
                 fi
               done
-            
+
               if [[ \$missing -ne 0 ]]; then
-                echo \"*** Sysroot missing required headers; dumping apt logs and exiting ***\" >&2
+                echo \"*** Sysroot missing required headers; dumping apt lists and logs and exiting ***\" >&2
                 ls -R /var/lib/apt/lists || true
                 tail -n +1 /var/log/apt/* || true
                 exit 2
               fi
-            
+
               # clean apt lists to keep sysroot small
               rm -rf /var/lib/apt/lists/* || true
             "
-            
-            # ensure sysroot readable
+
+            # unmount pseudo-filesystems (best-effort)
+            sudo umount -l "${SYSROOT}/proc" || true
+            sudo umount -l "${SYSROOT}/sys" || true
+            sudo umount -l "${SYSROOT}/dev/pts" || true
+            sudo umount -l "${SYSROOT}/dev" || true
+
+            # sysroot ready. make it readable
             sudo chmod -R a+rX "${SYSROOT}"
-            
-            # export cross-compiler env pointing to sysroot and build
+
+            # set cross compiler to use this sysroot
             export CC="arm-linux-gnueabihf-gcc --sysroot=${SYSROOT}"
             export CXX="arm-linux-gnueabihf-g++ --sysroot=${SYSROOT}"
             export CGO_ENABLED=1
@@ -304,15 +318,17 @@ jobs:
             export GOARM=7
             export CGO_CFLAGS="--sysroot=${SYSROOT}"
             export CGO_LDFLAGS="--sysroot=${SYSROOT} -L${SYSROOT}/lib -L${SYSROOT}/usr/lib"
-            
+
+            # Build with go
             CGO_ENABLED=1 GOOS=linux GOARCH="${GOARCH}" GOARM=7 \
               go build -buildvcs=false \
                 -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
                 -o "$archive_dir/cli-proxy-api" ./cmd/server/
-            
+
+            # 输出二进制需要的 GLIBC 符号以便检查（期望不高于 2.24）
             if command -v readelf >/dev/null 2>&1; then
               echo "Required GLIBC symbols (from built binary):"
-              readelf --version-info "$archive_dir/cli-proxy-api" | sed -n 's/.*Name: GLIBC_\([0-9.]*\).*/GLIBC_\1/p' | sort -Vu || true
+              readelf --version-info "$archive_dir/cli-proxy-api" | sed -n "s/.*Name: GLIBC_\\([0-9.]*\\).*/GLIBC_\\1/p" | sort -Vu || true
             fi
           fi
 
