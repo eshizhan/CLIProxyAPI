@@ -136,7 +136,7 @@ jobs:
         include:
           - target: linux-amd64
             runner: ubuntu-latest
-            goos: darwin   # kept original fields for clarity; not used in linux builds
+            goos: linux
             goarch: amd64
             asset_arch: amd64
             manylinux_image: quay.io/pypa/manylinux2014_x86_64
@@ -257,11 +257,23 @@ jobs:
             sudo mount --bind /dev "${SYSROOT}/dev" || true
             sudo mount --bind /dev/pts "${SYSROOT}/dev/pts" || true
 
-            # chroot: run second-stage then install dev packages, retries and debug output on failure
+            # chroot: run second-stage then install dev packages, retries and diagnostic printing on failure
             sudo chroot "${SYSROOT}" /usr/bin/qemu-arm-static /bin/bash -c "
               set -euo pipefail
+              # ensure /usr/bin is on PATH inside chroot
+              export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
               rm -rf /var/lib/apt/lists/* || true
-              /debootstrap/debootstrap --second-stage || true
+
+              echo 'Running debootstrap second-stage...'
+              if ! /debootstrap/debootstrap --second-stage; then
+                echo 'debootstrap --second-stage FAILED inside chroot' >&2
+                echo 'ls -la /' >&2
+                ls -la / || true
+                echo 'ls -la /usr:' >&2
+                ls -la /usr || true
+                exit 4
+              fi
 
               run_retry() {
                 local cmd=\"\$*\"
@@ -276,14 +288,21 @@ jobs:
                 return 1
               }
 
-              run_retry apt-get -o Acquire::Check-Valid-Until=false -o Acquire::AllowInsecureRepositories=true update
-              if ! run_retry apt-get -o Acquire::Check-Valid-Until=false -o Acquire::AllowInsecureRepositories=true -o APT::Get::AllowUnauthenticated=true install -y --no-install-recommends build-essential libc6-dev pkg-config ca-certificates ; then
-                echo \"*** apt install inside chroot failed; dumping diagnostics ***\" >&2
+              # use full path to apt-get to avoid PATH surprises
+              if ! run_retry /usr/bin/apt-get -o Acquire::Check-Valid-Until=false -o Acquire::AllowInsecureRepositories=true update; then
+                echo 'apt-get update failed inside chroot' >&2
+                ls -la /var/lib/apt/lists || true
+                tail -n +1 /var/log/apt/* || true
+                exit 5
+              fi
+
+              if ! run_retry /usr/bin/apt-get -o Acquire::Check-Valid-Until=false -o Acquire::AllowInsecureRepositories=true -o APT::Get::AllowUnauthenticated=true install -y --no-install-recommends build-essential libc6-dev pkg-config ca-certificates; then
+                echo 'apt-get install build-essential/libc6-dev failed inside chroot' >&2
                 ls -la /usr/include || true
                 ls -la /usr/include/arm-linux-gnueabihf || true
                 ls -la /var/lib/apt/lists || true
                 tail -n +1 /var/log/apt/* || true
-                exit 3
+                exit 6
               fi
 
               # sanity check headers
@@ -294,15 +313,13 @@ jobs:
                   missing=1
                 fi
               done
-
               if [[ \$missing -ne 0 ]]; then
-                echo \"*** Sysroot missing required headers; dumping debug info ***\" >&2
+                echo 'Headers missing after install inside chroot; dumping debug info' >&2
                 ls -la /usr/include || true
                 ls -la /usr/include/arm-linux-gnueabihf || true
                 dpkg -l build-essential libc6-dev pkg-config ca-certificates || true
-                ls -la /var/lib/apt/lists || true
                 tail -n +1 /var/log/apt/* || true
-                exit 2
+                exit 7
               fi
 
               rm -rf /var/lib/apt/lists/* || true
@@ -321,17 +338,17 @@ jobs:
             export CXX="arm-linux-gnueabihf-g++ --sysroot=${SYSROOT}"
             export CGO_ENABLED=1
             export GOOS=linux
-            export GOARCH=arm
+            export GOARCH="${GOARCH}"
             export GOARM=7
             export CGO_CFLAGS="--sysroot=${SYSROOT}"
             export CGO_LDFLAGS="--sysroot=${SYSROOT} -L${SYSROOT}/lib -L${SYSROOT}/usr/lib"
 
-            CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 \
+            CGO_ENABLED=1 GOOS=linux GOARCH="${GOARCH}" GOARM=7 \
               go build -buildvcs=false \
                 -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
                 -o "$archive_dir/cli-proxy-api" ./cmd/server/
 
-            if [[ -f "$archive_dir/cli-proxy-api" && "$(command -v readelf >/dev/null 2>&1 && echo ok || echo no)" == ok ]]; then
+            if [[ -f "$archive_dir/cli-proxy-api" ]]; then
               check_glibc "$archive_dir/cli-proxy-api" "${archive_dir}/build-readelf.txt"
             fi
           fi
@@ -425,7 +442,6 @@ jobs:
               echo "max_glibc=${max_glibc}" >> "$out"
               if [[ -n "${max_glibc}" && "$(printf '%s\n' "2.24" "${max_glibc}" | sort -V | tail -n1)" != "2.24" ]]; then
                 echo "Binary requires GLIBC_${max_glibc} which is > 2.24" | tee -a "$out" >&2
-                # non-fatal: keep artifact, but return non-zero to make the method job show failure
                 return 2
               fi
             else
@@ -437,7 +453,6 @@ jobs:
           case "${METHOD}" in
             qemu-docker)
               echo "qemu-docker build (arm32v7/debian:stretch)"
-              # run in ARM container (QEMU registered earlier)
               docker run --rm --platform=linux/arm/v7 \
                 -v "$PWD:/src" -w /src \
                 -e RELEASE_VERSION -e COMMIT -e BUILD_DATE \
@@ -475,47 +490,62 @@ jobs:
 
               sudo chroot "${SYSROOT}" /usr/bin/qemu-arm-static /bin/bash -c '
                 set -euo pipefail
+                export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
                 rm -rf /var/lib/apt/lists/* || true
-                /debootstrap/debootstrap --second-stage || true
+
+                echo "Running debootstrap second-stage..."
+                if ! /debootstrap/debootstrap --second-stage; then
+                  echo "debootstrap second-stage failed" >&2
+                  ls -la / || true
+                  ls -la /usr || true
+                  exit 4
+                fi
 
                 run_retry() {
-                  local cmd=\"\$*\"
+                  local cmd="$*"
                   local i
                   for i in 1 2 3; do
-                    if eval \"\$cmd\"; then
+                    if eval "$cmd"; then
                       return 0
                     fi
-                    echo \"Command failed (attempt \$i): \$cmd\" >&2
-                    sleep \$((i * 2))
+                    echo "Command failed (attempt $i): $cmd" >&2
+                    sleep $((i * 2))
                   done
                   return 1
                 }
 
-                run_retry apt-get -o Acquire::Check-Valid-Until=false -o Acquire::AllowInsecureRepositories=true update
-                if ! run_retry apt-get -o Acquire::Check-Valid-Until=false -o Acquire::AllowInsecureRepositories=true -o APT::Get::AllowUnauthenticated=true install -y --no-install-recommends build-essential libc6-dev pkg-config ca-certificates ; then
-                  echo \"*** apt install failed in chroot; list apt state and logs ***\" >&2
+                if ! run_retry /usr/bin/apt-get -o Acquire::Check-Valid-Until=false -o Acquire::AllowInsecureRepositories=true update; then
+                  echo "apt-get update failed inside chroot" >&2
                   ls -la /var/lib/apt/lists || true
                   tail -n +1 /var/log/apt/* || true
-                  exit 3
+                  exit 5
+                fi
+
+                if ! run_retry /usr/bin/apt-get -o Acquire::Check-Valid-Until=false -o Acquire::AllowInsecureRepositories=true -o APT::Get::AllowUnauthenticated=true install -y --no-install-recommends build-essential libc6-dev pkg-config ca-certificates; then
+                  echo "apt-get install build-essential/libc6-dev failed inside chroot" >&2
+                  ls -la /usr/include || true
+                  ls -la /usr/include/arm-linux-gnueabihf || true
+                  ls -la /var/lib/apt/lists || true
+                  tail -n +1 /var/log/apt/* || true
+                  exit 6
                 fi
 
                 # verify headers
                 missing=0
                 for h in stdlib.h stdint.h stdio.h pthread.h errno.h; do
-                  if [[ ! -f /usr/include/\$h && ! -f /usr/include/arm-linux-gnueabihf/\$h ]]; then
-                    echo \"MISSING header: \$h\" >&2
+                  if [[ ! -f /usr/include/$h && ! -f /usr/include/arm-linux-gnueabihf/$h ]]; then
+                    echo "MISSING header: $h" >&2
                     missing=1
                   fi
                 done
-
-                if [[ \$missing -ne 0 ]]; then
-                  echo \"*** Sysroot missing headers; dumping debug info ***\" >&2
+                if [[ $missing -ne 0 ]]; then
+                  echo "Headers missing after install; dumping debug info" >&2
                   ls -la /usr/include || true
                   ls -la /usr/include/arm-linux-gnueabihf || true
                   dpkg -l build-essential libc6-dev pkg-config ca-certificates || true
-                  ls -la /var/lib/apt/lists || true
                   tail -n +1 /var/log/apt/* || true
-                  exit 2
+                  exit 7
                 fi
 
                 rm -rf /var/lib/apt/lists/* || true
@@ -573,20 +603,18 @@ jobs:
               ;;
           esac
 
-          # always attempt to copy packaging files and tar up
+          # packaging (attempt regardless)
           cp LICENSE README.md README_CN.md config.example.yaml "$archive_dir/" || true
           tar -C "$archive_dir" -czf "dist/${outname}" -C "$archive_dir" . || true
 
           BINPATH="${archive_dir}/cli-proxy-api"
           if [[ -f "${BINPATH}" ]]; then
             if ! check_glibc_and_maybe_fail "${BINPATH}"; then
-              echo "GLIBC check signaled failure for ${METHOD}; artifact kept for inspection." >&2
-              # return nonzero so the matrix cell shows failure if glibc > 2.24
+              echo "GLIBC check signaled failure for ${METHOD}; artifact retained." >&2
               exit 2
             fi
           else
             echo "No binary produced by method ${METHOD}; check logs" >&2
-            # nonzero to flag the matrix cell
             exit 3
           fi
 
@@ -597,7 +625,7 @@ jobs:
           path: dist/linux-armv7/${{ matrix.method }}/*
           if-no-files-found: warn
 
-  # build-linux-no-plugin & build-freebsd are omitted per prior request
+  # build-linux-no-plugin & build-freebsd remain omitted per previous request
 
   publish-checksums:
     runs-on: ubuntu-latest
