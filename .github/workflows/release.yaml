@@ -93,7 +93,7 @@ jobs:
             cat "$changelog_notes_file"
           } > "$updated_notes_file"
 
-          # final truncation protection (GitHub 422)
+          # final truncation protection
           max_bytes=1200
           if [[ -n "$previous_tag" ]]; then
             suffix="$(printf '\n\n**(truncated)** Full changelog: https://github.com/%s/compare/%s...%s\n' "$GH_REPO" "$previous_tag" "$GITHUB_REF_NAME")"
@@ -124,34 +124,24 @@ jobs:
             gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file "$updated_notes_file"
           fi
 
-  # build-hosted (macOS / Windows) intentionally commented/omitted per previous request
-
   build-linux-glibc:
-    name: build linux-${{ matrix.target }}
+    name: build linux (manylinux/docker)
     needs: prepare-release
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: linux-amd64
             runner: ubuntu-latest
-            goos: linux
             goarch: amd64
             asset_arch: amd64
             manylinux_image: quay.io/pypa/manylinux2014_x86_64
           - target: linux-arm64
             runner: ubuntu-24.04-arm
-            goos: linux
             goarch: arm64
             asset_arch: aarch64
             manylinux_image: quay.io/pypa/manylinux2014_aarch64
-          - target: linux-armv7
-            runner: ubuntu-latest
-            goos: linux
-            goarch: arm
-            asset_arch: armv7
-            manylinux_image: ''    # empty => use runner debootstrap branch
     steps:
       - uses: actions/checkout@v6
         with:
@@ -161,201 +151,50 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
       - name: Refresh models catalog
-        shell: bash
         run: bash .github/scripts/refresh-model-catalogs.sh
       - name: Fetch tags
-        shell: bash
         run: git fetch --force --tags
-      - name: Generate Build Metadata
-        shell: bash
+      - name: Generate metadata
         run: |
-          set -euo pipefail
           echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
           echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
-      - name: Build archive
-        shell: bash
+      - name: Build (manylinux)
         env:
-          TARGET: ${{ matrix.target }}
           GOARCH: ${{ matrix.goarch }}
           ASSET_ARCH: ${{ matrix.asset_arch }}
           MANYLINUX_IMAGE: ${{ matrix.manylinux_image }}
         run: |
           set -euo pipefail
-
+          TARGET="${{ matrix.target }}"
           archive_dir="dist/${TARGET}/archive"
           archive_name="CLIProxyAPI_${RELEASE_VERSION}_${TARGET}_${ASSET_ARCH}.tar.gz"
           rm -rf "dist/${TARGET}"
           mkdir -p "$archive_dir"
 
-          # helper: check glibc requirement and write readelf result
-          check_glibc() {
-            bin="$1"
-            out="$2"
-            if command -v readelf >/dev/null 2>&1; then
-              max_glibc=$(readelf --version-info "$bin" 2>/dev/null | sed -n "s/.*Name: GLIBC_\([0-9.]*\).*/\1/p" | sort -Vu | tail -n1 || true)
-              echo "max_glibc=${max_glibc}" > "$out"
-            else
-              echo "readelf: not available" > "$out"
-            fi
-          }
+          docker run --rm \
+            -v "$PWD:/src" \
+            -w /src \
+            -e GO_VERSION \
+            -e GOARCH \
+            -e RELEASE_VERSION \
+            -e COMMIT \
+            -e BUILD_DATE \
+            "${MANYLINUX_IMAGE}" \
+            bash -euo pipefail -c '
+              go_archive="go${GO_VERSION}.linux-${GOARCH}.tar.gz"
+              curl -fsSL "https://go.dev/dl/${go_archive}" -o "/tmp/${go_archive}"
+              rm -rf /usr/local/go
+              tar -C /usr/local -xzf "/tmp/${go_archive}"
+              export PATH="/usr/local/go/bin:${PATH}"
 
-          if [[ -n "${MANYLINUX_IMAGE}" ]]; then
-            # manylinux docker build (original path)
-            docker run --rm \
-              -v "$PWD:/src" \
-              -w /src \
-              -e GO_VERSION \
-              -e GOARCH \
-              -e RELEASE_VERSION \
-              -e COMMIT \
-              -e BUILD_DATE \
-              "$MANYLINUX_IMAGE" \
-              bash -euo pipefail -c '
-                go_archive="go${GO_VERSION}.linux-${GOARCH}.tar.gz"
-                curl -fsSL "https://go.dev/dl/${go_archive}" -o "/tmp/${go_archive}"
-                rm -rf /usr/local/go
-                tar -C /usr/local -xzf "/tmp/${go_archive}"
-                export PATH="/usr/local/go/bin:${PATH}"
-
-                CGO_ENABLED=1 GOOS=linux GOARCH="${GOARCH}" go build -buildvcs=false \
-                  -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
-                  -o "'"$archive_dir"'/cli-proxy-api" ./cmd/server/
-              '
-            if [[ -f "$archive_dir/cli-proxy-api" ]]; then
-              check_glibc "$archive_dir/cli-proxy-api" "${archive_dir}/build-readelf.txt"
-            fi
-          else
-            # Runner branch: create Debian stretch (armhf) sysroot with debootstrap (archive.debian.org)
-            echo "Building for ${GOARCH} using Debian stretch (armhf) sysroot from archive.debian.org"
-
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends debootstrap qemu-user-static binfmt-support \
-              gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf
-
-            SYSROOT="/tmp/stretch-sysroot"
-            sudo rm -rf "${SYSROOT}"
-            sudo mkdir -p "${SYSROOT}"
-
-            # debootstrap -> foreign stage
-            DEBOOT_URL="http://archive.debian.org/debian"
-            sudo debootstrap --arch=armhf --foreign --variant=minbase stretch "${SYSROOT}" "${DEBOOT_URL}"
-
-            # copy qemu static into sysroot for second-stage
-            sudo cp /usr/bin/qemu-arm-static "${SYSROOT}/usr/bin/" || true
-
-            # configure apt inside sysroot to use archive and ignore Valid-Until and allow archived repo
-            sudo mkdir -p "${SYSROOT}/etc/apt/apt.conf.d"
-            echo 'Acquire::Check-Valid-Until "false";' | sudo tee "${SYSROOT}/etc/apt/apt.conf.d/99no-check-valid-until" >/dev/null
-            echo 'Acquire::AllowInsecureRepositories "true";' | sudo tee "${SYSROOT}/etc/apt/apt.conf.d/99allow-insecure" >/dev/null
-            echo 'APT::Get::AllowUnauthenticated "true";' | sudo tee "${SYSROOT}/etc/apt/apt.conf.d/99allow-unauth" >/dev/null
-            printf '%s\n' "deb http://archive.debian.org/debian stretch main" "deb http://archive.debian.org/debian-security stretch/updates main" | sudo tee "${SYSROOT}/etc/apt/sources.list" >/dev/null
-
-            # bind pseudo-filesystems for chroot
-            sudo mount --bind /proc "${SYSROOT}/proc" || true
-            sudo mount --bind /sys "${SYSROOT}/sys" || true
-            sudo mount --bind /dev "${SYSROOT}/dev" || true
-            sudo mount --bind /dev/pts "${SYSROOT}/dev/pts" || true
-
-            # chroot: run second-stage then install dev packages, retries and diagnostic printing on failure
-            sudo chroot "${SYSROOT}" /usr/bin/qemu-arm-static /bin/bash -c "
-              set -euo pipefail
-              # ensure /usr/bin is on PATH inside chroot
-              export PATH=/usr/bin:/bin:/usr/sbin:/sbin
-
-              rm -rf /var/lib/apt/lists/* || true
-
-              echo 'Running debootstrap second-stage...'
-              if ! /debootstrap/debootstrap --second-stage; then
-                echo 'debootstrap --second-stage FAILED inside chroot' >&2
-                echo 'ls -la /' >&2
-                ls -la / || true
-                echo 'ls -la /usr:' >&2
-                ls -la /usr || true
-                exit 4
-              fi
-
-              run_retry() {
-                local cmd=\"\$*\"
-                local i
-                for i in 1 2 3; do
-                  if eval \"\$cmd\"; then
-                    return 0
-                  fi
-                  echo \"Command failed (attempt \$i): \$cmd\" >&2
-                  sleep \$((i * 2))
-                done
-                return 1
-              }
-
-              # use full path to apt-get to avoid PATH surprises
-              if ! run_retry /usr/bin/apt-get -o Acquire::Check-Valid-Until=false -o Acquire::AllowInsecureRepositories=true update; then
-                echo 'apt-get update failed inside chroot' >&2
-                ls -la /var/lib/apt/lists || true
-                tail -n +1 /var/log/apt/* || true
-                exit 5
-              fi
-
-              if ! run_retry /usr/bin/apt-get -o Acquire::Check-Valid-Until=false -o Acquire::AllowInsecureRepositories=true -o APT::Get::AllowUnauthenticated=true install -y --no-install-recommends build-essential libc6-dev pkg-config ca-certificates; then
-                echo 'apt-get install build-essential/libc6-dev failed inside chroot' >&2
-                ls -la /usr/include || true
-                ls -la /usr/include/arm-linux-gnueabihf || true
-                ls -la /var/lib/apt/lists || true
-                tail -n +1 /var/log/apt/* || true
-                exit 6
-              fi
-
-              # sanity check headers
-              missing=0
-              for h in stdlib.h stdint.h stdio.h pthread.h errno.h; do
-                if [[ ! -f /usr/include/\$h && ! -f /usr/include/arm-linux-gnueabihf/\$h ]]; then
-                  echo \"MISSING header: \$h\" >&2
-                  missing=1
-                fi
-              done
-              if [[ \$missing -ne 0 ]]; then
-                echo 'Headers missing after install inside chroot; dumping debug info' >&2
-                ls -la /usr/include || true
-                ls -la /usr/include/arm-linux-gnueabihf || true
-                dpkg -l build-essential libc6-dev pkg-config ca-certificates || true
-                tail -n +1 /var/log/apt/* || true
-                exit 7
-              fi
-
-              rm -rf /var/lib/apt/lists/* || true
-            "
-
-            # unmount pseudo-filesystems (best-effort)
-            sudo umount -l "${SYSROOT}/proc" || true
-            sudo umount -l "${SYSROOT}/sys" || true
-            sudo umount -l "${SYSROOT}/dev/pts" || true
-            sudo umount -l "${SYSROOT}/dev" || true
-
-            sudo chmod -R a+rX "${SYSROOT}"
-
-            # cross-compile using sysroot
-            export CC="arm-linux-gnueabihf-gcc --sysroot=${SYSROOT}"
-            export CXX="arm-linux-gnueabihf-g++ --sysroot=${SYSROOT}"
-            export CGO_ENABLED=1
-            export GOOS=linux
-            export GOARCH="${GOARCH}"
-            export GOARM=7
-            export CGO_CFLAGS="--sysroot=${SYSROOT}"
-            export CGO_LDFLAGS="--sysroot=${SYSROOT} -L${SYSROOT}/lib -L${SYSROOT}/usr/lib"
-
-            CGO_ENABLED=1 GOOS=linux GOARCH="${GOARCH}" GOARM=7 \
-              go build -buildvcs=false \
+              CGO_ENABLED=1 GOOS=linux GOARCH="${GOARCH}" go build -buildvcs=false \
                 -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
-                -o "$archive_dir/cli-proxy-api" ./cmd/server/
+                -o "'"$archive_dir"'/cli-proxy-api" ./cmd/server/
+            '
 
-            if [[ -f "$archive_dir/cli-proxy-api" ]]; then
-              check_glibc "$archive_dir/cli-proxy-api" "${archive_dir}/build-readelf.txt"
-            fi
-          fi
-
-          # package artifacts even if some steps had nonfatal errors
           cp LICENSE README.md README_CN.md config.example.yaml "$archive_dir/" || true
-          tar -C "$archive_dir" -czf "dist/$archive_name" -C "$archive_dir" . || true
+          tar -C "$archive_dir" -czf "dist/$archive_name" cli-proxy-api LICENSE README.md README_CN.md config.example.yaml
 
       - uses: actions/upload-artifact@v4
         with:
@@ -364,20 +203,16 @@ jobs:
           if-no-files-found: error
 
       - name: Upload release assets
-        shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           shopt -s nullglob
           assets=(dist/*_${{ matrix.target }}*.tar.gz)
-          if [[ ${#assets[@]} -eq 0 ]]; then
-            printf 'expected release archives for %s, found %s\n' "${{ matrix.target }}" "${#assets[@]}" >&2
-            exit 0
+          if [[ ${#assets[@]} -gt 0 ]]; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber || true
           fi
-          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber || true
 
-  # Parallel armv7 trial job (multiple strategies)
   build-armv7-parallel:
     name: build armv7 (parallel methods)
     needs: prepare-release
@@ -386,7 +221,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
-        method: [qemu-docker, debootstrap-chroot, crosspkg-sysroot, static-fallback]
+        method: [qemu-docker, crosspkg-sysroot, static-fallback]
     steps:
       - uses: actions/checkout@v6
         with:
@@ -408,12 +243,6 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Refresh models catalog
-        run: bash .github/scripts/refresh-model-catalogs.sh
-
-      - name: Fetch tags
-        run: git fetch --force --tags
-
       - name: Generate metadata
         run: |
           echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
@@ -433,26 +262,21 @@ jobs:
           rm -rf "dist/${TARGET}/${METHOD}"
           mkdir -p "$archive_dir"
 
-          check_glibc_and_maybe_fail() {
+          check_glibc_and_write() {
             bin="$1"
-            out="$archive_dir/build-readelf-${METHOD}.txt"
+            out="$2"
             if command -v readelf >/dev/null 2>&1; then
               max_glibc=$(readelf --version-info "$bin" 2>/dev/null | sed -n "s/.*Name: GLIBC_\([0-9.]*\).*/\1/p" | sort -Vu | tail -n1 || true)
-              echo "method=${METHOD}" > "$out"
-              echo "max_glibc=${max_glibc}" >> "$out"
-              if [[ -n "${max_glibc}" && "$(printf '%s\n' "2.24" "${max_glibc}" | sort -V | tail -n1)" != "2.24" ]]; then
-                echo "Binary requires GLIBC_${max_glibc} which is > 2.24" | tee -a "$out" >&2
-                return 2
-              fi
+              echo "max_glibc=${max_glibc}" > "$out"
             else
-              echo "readelf not available; cannot check GLIBC" > "$out"
+              echo "readelf: not available" > "$out"
             fi
-            return 0
           }
 
           case "${METHOD}" in
             qemu-docker)
               echo "qemu-docker build (arm32v7/debian:stretch)"
+              # run in ARM container (QEMU registered earlier)
               docker run --rm --platform=linux/arm/v7 \
                 -v "$PWD:/src" -w /src \
                 -e RELEASE_VERSION -e COMMIT -e BUILD_DATE \
@@ -460,115 +284,12 @@ jobs:
                 bash -eux -c '
                   apt-get update
                   apt-get install -y --no-install-recommends build-essential ca-certificates curl golang-go
+                  export GOPATH=/go
+                  export PATH=/usr/local/go/bin:/usr/bin:$PATH || true
                   CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 \
                     go build -buildvcs=false -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
                     -o "'"$archive_dir"'/cli-proxy-api" ./cmd/server/
                 '
-              ;;
-
-            debootstrap-chroot)
-              echo "debootstrap-chroot build (archive.debian.org)"
-              sudo apt-get update
-              sudo apt-get install -y --no-install-recommends debootstrap qemu-user-static binfmt-support \
-                gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf
-              SYSROOT=/tmp/stretch-sysroot-${RUNNER_TEMP}
-              sudo rm -rf "${SYSROOT}"
-              sudo mkdir -p "${SYSROOT}"
-              DEBOOT_URL="http://archive.debian.org/debian"
-              sudo debootstrap --arch=armhf --foreign --variant=minbase stretch "${SYSROOT}" "${DEBOOT_URL}"
-              sudo cp /usr/bin/qemu-arm-static "${SYSROOT}/usr/bin/" || true
-              sudo mkdir -p "${SYSROOT}/etc/apt/apt.conf.d"
-              echo 'Acquire::Check-Valid-Until "false";' | sudo tee "${SYSROOT}/etc/apt/apt.conf.d/99no-check-valid-until" >/dev/null
-              echo 'Acquire::AllowInsecureRepositories "true";' | sudo tee "${SYSROOT}/etc/apt/apt.conf.d/99allow-insecure" >/dev/null
-              echo 'APT::Get::AllowUnauthenticated "true";' | sudo tee "${SYSROOT}/etc/apt/apt.conf.d/99allow-unauth" >/dev/null
-              printf '%s\n' "deb http://archive.debian.org/debian stretch main" "deb http://archive.debian.org/debian-security stretch/updates main" | sudo tee "${SYSROOT}/etc/apt/sources.list" >/dev/null
-
-              sudo mount --bind /proc "${SYSROOT}/proc" || true
-              sudo mount --bind /sys "${SYSROOT}/sys" || true
-              sudo mount --bind /dev "${SYSROOT}/dev" || true
-              sudo mount --bind /dev/pts "${SYSROOT}/dev/pts" || true
-
-              sudo chroot "${SYSROOT}" /usr/bin/qemu-arm-static /bin/bash -c '
-                set -euo pipefail
-                export PATH=/usr/bin:/bin:/usr/sbin:/sbin
-
-                rm -rf /var/lib/apt/lists/* || true
-
-                echo "Running debootstrap second-stage..."
-                if ! /debootstrap/debootstrap --second-stage; then
-                  echo "debootstrap second-stage failed" >&2
-                  ls -la / || true
-                  ls -la /usr || true
-                  exit 4
-                fi
-
-                run_retry() {
-                  local cmd="$*"
-                  local i
-                  for i in 1 2 3; do
-                    if eval "$cmd"; then
-                      return 0
-                    fi
-                    echo "Command failed (attempt $i): $cmd" >&2
-                    sleep $((i * 2))
-                  done
-                  return 1
-                }
-
-                if ! run_retry /usr/bin/apt-get -o Acquire::Check-Valid-Until=false -o Acquire::AllowInsecureRepositories=true update; then
-                  echo "apt-get update failed inside chroot" >&2
-                  ls -la /var/lib/apt/lists || true
-                  tail -n +1 /var/log/apt/* || true
-                  exit 5
-                fi
-
-                if ! run_retry /usr/bin/apt-get -o Acquire::Check-Valid-Until=false -o Acquire::AllowInsecureRepositories=true -o APT::Get::AllowUnauthenticated=true install -y --no-install-recommends build-essential libc6-dev pkg-config ca-certificates; then
-                  echo "apt-get install build-essential/libc6-dev failed inside chroot" >&2
-                  ls -la /usr/include || true
-                  ls -la /usr/include/arm-linux-gnueabihf || true
-                  ls -la /var/lib/apt/lists || true
-                  tail -n +1 /var/log/apt/* || true
-                  exit 6
-                fi
-
-                # verify headers
-                missing=0
-                for h in stdlib.h stdint.h stdio.h pthread.h errno.h; do
-                  if [[ ! -f /usr/include/$h && ! -f /usr/include/arm-linux-gnueabihf/$h ]]; then
-                    echo "MISSING header: $h" >&2
-                    missing=1
-                  fi
-                done
-                if [[ $missing -ne 0 ]]; then
-                  echo "Headers missing after install; dumping debug info" >&2
-                  ls -la /usr/include || true
-                  ls -la /usr/include/arm-linux-gnueabihf || true
-                  dpkg -l build-essential libc6-dev pkg-config ca-certificates || true
-                  tail -n +1 /var/log/apt/* || true
-                  exit 7
-                fi
-
-                rm -rf /var/lib/apt/lists/* || true
-              '
-
-              sudo umount -l "${SYSROOT}/proc" || true
-              sudo umount -l "${SYSROOT}/sys" || true
-              sudo umount -l "${SYSROOT}/dev/pts" || true
-              sudo umount -l "${SYSROOT}/dev" || true
-              sudo chmod -R a+rX "${SYSROOT}"
-
-              export CC="arm-linux-gnueabihf-gcc --sysroot=${SYSROOT}"
-              export CXX="arm-linux-gnueabihf-g++ --sysroot=${SYSROOT}"
-              export CGO_ENABLED=1
-              export GOOS=linux
-              export GOARCH=arm
-              export GOARM=7
-              export CGO_CFLAGS="--sysroot=${SYSROOT}"
-              export CGO_LDFLAGS="--sysroot=${SYSROOT} -L${SYSROOT}/lib -L${SYSROOT}/usr/lib"
-
-              CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 \
-                go build -buildvcs=false -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
-                -o "${archive_dir}/cli-proxy-api" ./cmd/server/
               ;;
 
             crosspkg-sysroot)
@@ -603,15 +324,20 @@ jobs:
               ;;
           esac
 
-          # packaging (attempt regardless)
+          # package and record readelf info
           cp LICENSE README.md README_CN.md config.example.yaml "$archive_dir/" || true
           tar -C "$archive_dir" -czf "dist/${outname}" -C "$archive_dir" . || true
 
           BINPATH="${archive_dir}/cli-proxy-api"
           if [[ -f "${BINPATH}" ]]; then
-            if ! check_glibc_and_maybe_fail "${BINPATH}"; then
-              echo "GLIBC check signaled failure for ${METHOD}; artifact retained." >&2
-              exit 2
+            check_glibc_and_write "${BINPATH}" "${archive_dir}/build-readelf-${METHOD}.txt"
+            # if readelf reports max_glibc and it's >2.24, exit non-zero so the matrix cell shows a failure (still uploaded)
+            if command -v readelf >/dev/null 2>&1; then
+              max_glibc=$(sed -n 's/^max_glibc=//p' "${archive_dir}/build-readelf-${METHOD}.txt" | tr -d '\r\n' || true)
+              if [[ -n "${max_glibc}" && "$(printf '%s\n' "2.24" "${max_glibc}" | sort -V | tail -n1)" != "2.24" ]]; then
+                echo "Binary requires GLIBC_${max_glibc} which is > 2.24" | tee -a "${archive_dir}/build-readelf-${METHOD}.txt" >&2
+                exit 2
+              fi
             fi
           else
             echo "No binary produced by method ${METHOD}; check logs" >&2
@@ -624,8 +350,6 @@ jobs:
           name: armv7-${{ matrix.method }}
           path: dist/linux-armv7/${{ matrix.method }}/*
           if-no-files-found: warn
-
-  # build-linux-no-plugin & build-freebsd remain omitted per previous request
 
   publish-checksums:
     runs-on: ubuntu-latest
