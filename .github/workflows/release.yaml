@@ -1,3 +1,4 @@
+# release workflow — includes parallel armv7 trial job
 name: release
 
 on:
@@ -63,10 +64,9 @@ jobs:
             -f tag_name="$GITHUB_REF_NAME" \
             --jq .body > "$generated_notes_file"
 
-          # 若自动生成的 release notes 过长，先做一次宽松截断（保险）
+          # truncate generated notes if huge
           gen_max=100000
           if [[ -s "$generated_notes_file" && $(wc -c <"$generated_notes_file") -gt $gen_max ]]; then
-            echo "Generated notes too long ($(wc -c <\"$generated_notes_file\") bytes), truncating to ${gen_max} bytes" >&2
             head -c "$gen_max" "$generated_notes_file" > "${generated_notes_file}.trunc"
             mv "${generated_notes_file}.trunc" "$generated_notes_file"
           fi
@@ -94,7 +94,7 @@ jobs:
             cat "$changelog_notes_file"
           } > "$updated_notes_file"
 
-          # 最终截断保护，确保最终 release body 不超过 max_bytes
+          # final truncation (protect against GitHub 422)
           max_bytes=1200
           if [[ -n "$previous_tag" ]]; then
             suffix="$(printf '\n\n**(truncated)** Full changelog: https://github.com/%s/compare/%s...%s\n' "$GH_REPO" "$previous_tag" "$GITHUB_REF_NAME")"
@@ -125,9 +125,9 @@ jobs:
             gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file "$updated_notes_file"
           fi
 
-  # Commented out: build-hosted (macOS / Windows) per request to keep only Linux builds
+  # build-hosted (macOS / Windows) commented out per request
   # build-hosted:
-  #   (omitted - commented)
+  #   (omitted)
 
   build-linux-glibc:
     name: build linux-${{ matrix.goarch }} glibc
@@ -151,7 +151,7 @@ jobs:
             runner: ubuntu-latest
             goarch: arm
             asset_arch: armv7
-            manylinux_image: ''    # empty -> 不使用 manylinux docker，改为在 runner 上用 debootstrap + cross 编译（Debian stretch sysroot）
+            manylinux_image: ''    # empty -> runner cross-build branch (debootstrap)
     steps:
       - uses: actions/checkout@v6
         with:
@@ -189,7 +189,7 @@ jobs:
           mkdir -p "$archive_dir"
 
           if [[ -n "${MANYLINUX_IMAGE}" ]]; then
-            # manylinux docker 构建（原逻辑）
+            # manylinux docker build (original)
             docker run --rm \
               -v "$PWD:/src" \
               -w /src \
@@ -221,10 +221,10 @@ jobs:
                 fi
               '
           else
-            # Runner 上：使用 debootstrap 从 archive.debian.org 构建 stretch (armhf) sysroot，然后用交叉编译器并指定 --sysroot 链接 glibc 2.24
-            echo "Building for ${GOARCH} using Debian stretch (armhf) sysroot built from archive.debian.org"
+            # Runner branch: create Debian stretch (armhf) sysroot via debootstrap (archive.debian.org)
+            echo "Building for ${GOARCH} using Debian stretch (armhf) sysroot (archive.debian.org)"
 
-            # 安装需要的工具：debootstrap, qemu-user-static, cross toolchain
+            # install helper tools
             sudo apt-get update
             sudo apt-get install -y --no-install-recommends debootstrap qemu-user-static binfmt-support \
               gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf
@@ -233,32 +233,27 @@ jobs:
             sudo rm -rf "${SYSROOT}"
             sudo mkdir -p "${SYSROOT}"
 
-            # 使用官方 archive.debian.org 通过 debootstrap 创建最小 rootfs （foreign 模式）
             DEBOOTSTRAP_URL="http://archive.debian.org/debian"
             sudo debootstrap --arch=armhf --foreign --variant=minbase stretch "${SYSROOT}" "${DEBOOTSTRAP_URL}"
 
-            # 复制 qemu-user-static 以便在 chroot 内运行 second-stage
+            # copy qemu static binary
             sudo cp /usr/bin/qemu-arm-static "${SYSROOT}/usr/bin/" || true
 
-            # 在 sysroot 中写入 apt 配置，指向 archive.debian.org，并禁用 valid-until 检查
+            # configure apt in sysroot -> archive.debian.org and ignore valid-until
             sudo mkdir -p "${SYSROOT}/etc/apt/apt.conf.d"
             echo 'Acquire::Check-Valid-Until "false";' | sudo tee "${SYSROOT}/etc/apt/apt.conf.d/99no-check-valid-until" >/dev/null
             printf '%s\n' "deb http://archive.debian.org/debian stretch main" "deb http://archive.debian.org/debian-security stretch/updates main" | sudo tee "${SYSROOT}/etc/apt/sources.list" >/dev/null
 
-            # bind-mount pseudo-filesystems for chroot
+            # bind-mount pseudo-filesystems
             sudo mount --bind /proc "${SYSROOT}/proc" || true
             sudo mount --bind /sys "${SYSROOT}/sys" || true
             sudo mount --bind /dev "${SYSROOT}/dev" || true
             sudo mount --bind /dev/pts "${SYSROOT}/dev/pts" || true
 
-            # run debootstrap second-stage inside chroot (using qemu), then install dev packages inside chroot with retries; fail loudly and print apt logs if something goes wrong
+            # chroot: complete second-stage, install dev packages, verify headers
             sudo chroot "${SYSROOT}" /usr/bin/qemu-arm-static /bin/bash -c "
               set -euo pipefail
-
-              # remove any stale lists
               rm -rf /var/lib/apt/lists/* || true
-
-              echo 'Running debootstrap second-stage...'
               /debootstrap/debootstrap --second-stage
 
               # retry helper
@@ -275,28 +270,31 @@ jobs:
                 return 1
               }
 
-              # update and install dev packages needed for CGO (headers, pthread, etc.)
               run_retry apt-get -o Acquire::Check-Valid-Until=false update
               run_retry apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends \
                 build-essential libc6-dev pkg-config ca-certificates
 
-              # sanity check: ensure key headers exist
+              # verify headers
               missing=0
               for h in stdlib.h stdint.h stdio.h pthread.h errno.h; do
-                if [[ ! -f /usr/include/\$h && ! -f /usr/include/\$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null)/\$h ]]; then
-                  echo \"MISSING header: /usr/include/\$h\" >&2
+                if [[ ! -f /usr/include/\$h && ! -f /usr/include/arm-linux-gnueabihf/\$h ]]; then
+                  echo \"MISSING header: \$h\" >&2
                   missing=1
                 fi
               done
 
               if [[ \$missing -ne 0 ]]; then
-                echo \"*** Sysroot missing required headers; dumping apt lists and logs and exiting ***\" >&2
-                ls -R /var/lib/apt/lists || true
+                echo \"*** Sysroot missing required headers; dumping debug info ***\" >&2
+                echo 'ls -la /usr/include:' >&2
+                ls -la /usr/include || true
+                echo 'ls -la /usr/include/arm-linux-gnueabihf:' >&2
+                ls -la /usr/include/arm-linux-gnueabihf || true
+                dpkg -l build-essential libc6-dev pkg-config ca-certificates || true
+                ls -la /var/lib/apt/lists || true
                 tail -n +1 /var/log/apt/* || true
                 exit 2
               fi
 
-              # clean apt lists to keep sysroot small
               rm -rf /var/lib/apt/lists/* || true
             "
 
@@ -306,10 +304,9 @@ jobs:
             sudo umount -l "${SYSROOT}/dev/pts" || true
             sudo umount -l "${SYSROOT}/dev" || true
 
-            # sysroot ready. make it readable
             sudo chmod -R a+rX "${SYSROOT}"
 
-            # set cross compiler to use this sysroot
+            # cross-compile using sysroot
             export CC="arm-linux-gnueabihf-gcc --sysroot=${SYSROOT}"
             export CXX="arm-linux-gnueabihf-g++ --sysroot=${SYSROOT}"
             export CGO_ENABLED=1
@@ -319,13 +316,11 @@ jobs:
             export CGO_CFLAGS="--sysroot=${SYSROOT}"
             export CGO_LDFLAGS="--sysroot=${SYSROOT} -L${SYSROOT}/lib -L${SYSROOT}/usr/lib"
 
-            # Build with go
             CGO_ENABLED=1 GOOS=linux GOARCH="${GOARCH}" GOARM=7 \
               go build -buildvcs=false \
                 -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
                 -o "$archive_dir/cli-proxy-api" ./cmd/server/
 
-            # 输出二进制需要的 GLIBC 符号以便检查（期望不高于 2.24）
             if command -v readelf >/dev/null 2>&1; then
               echo "Required GLIBC symbols (from built binary):"
               readelf --version-info "$archive_dir/cli-proxy-api" | sed -n "s/.*Name: GLIBC_\\([0-9.]*\\).*/GLIBC_\\1/p" | sort -Vu || true
@@ -383,17 +378,199 @@ jobs:
           )
           gh release upload "$GITHUB_REF_NAME" "$tmp_dir/checksums.txt" --clobber
 
-  # Commented out: build-linux-no-plugin per request to drop _no-plugin builds
-  # ... (omitted)
+  # Parallel armv7 trial job: tries multiple strategies in parallel and uploads artifacts + readelf output
+  build-armv7-parallel:
+    name: build armv7 (parallel methods)
+    needs: prepare-release
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        method: [qemu-docker, debootstrap-chroot, crosspkg-sysroot, static-fallback]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
-  # Commented out: build-freebsd per request to keep only Linux builds
-  # ... (omitted)
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Refresh models catalog
+        run: bash .github/scripts/refresh-model-catalogs.sh
+
+      - name: Fetch tags
+        run: git fetch --force --tags
+
+      - name: Generate metadata
+        run: |
+          echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - name: Build (method = ${{ matrix.method }})
+        env:
+          METHOD: ${{ matrix.method }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET=linux-armv7
+          ASSET_ARCH=armv7
+          archive_dir="dist/${TARGET}/${METHOD}/archive"
+          outname="CLIProxyAPI_${RELEASE_VERSION}_linux_${ASSET_ARCH}_${METHOD}.tar.gz"
+          rm -rf "dist/${TARGET}/${METHOD}"
+          mkdir -p "$archive_dir"
+
+          check_glibc_and_maybe_fail() {
+            if command -v readelf >/dev/null 2>&1; then
+              max_glibc=$(readelf --version-info "$1" 2>/dev/null \
+                | sed -n "s/.*Name: GLIBC_\\([0-9.]*\\).*/\\1/p" | sort -Vu | tail -n1 || true)
+              echo "method=${METHOD} max_glibc=${max_glibc}" > "${archive_dir}/build-readelf-${METHOD}.txt"
+              if [[ -n "${max_glibc}" && "$(printf '%s\n' "2.24" "${max_glibc}" | sort -V | tail -n1)" != "2.24" ]]; then
+                echo "Binary requires GLIBC_${max_glibc} which is > 2.24" | tee -a "${archive_dir}/build-readelf-${METHOD}.txt" >&2
+                if [[ "${METHOD}" != "static-fallback" ]]; then
+                  return 2
+                fi
+              fi
+            else
+              echo "readelf not available; cannot check GLIBC" > "${archive_dir}/build-readelf-${METHOD}.txt"
+            fi
+            return 0
+          }
+
+          case "${METHOD}" in
+            qemu-docker)
+              echo "qemu-docker build (arm32v7/debian:stretch)"
+              # Ensure your runner supports docker --platform or use docker/setup-qemu-action in a prior step if needed
+              docker run --rm --platform=linux/arm/v7 \
+                -v "$PWD:/src" -w /src \
+                -e RELEASE_VERSION -e COMMIT -e BUILD_DATE \
+                arm32v7/debian:stretch \
+                bash -eux -c '
+                  apt-get update
+                  apt-get install -y --no-install-recommends build-essential ca-certificates curl golang-go
+                  CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 \
+                    go build -buildvcs=false -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
+                    -o "'"$archive_dir"'/cli-proxy-api" ./cmd/server/
+                '
+              cp LICENSE README.md README_CN.md config.example.yaml "$archive_dir/" || true
+              tar -C "$archive_dir" -czf "dist/${outname}" cli-proxy-api LICENSE README.md README_CN.md config.example.yaml || true
+              ;;
+
+            debootstrap-chroot)
+              echo "debootstrap-chroot build (archive.debian.org)"
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends debootstrap qemu-user-static binfmt-support \
+                gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf
+              SYSROOT=/tmp/stretch-sysroot-${RUNNER_TEMP}
+              sudo rm -rf "${SYSROOT}"
+              sudo mkdir -p "${SYSROOT}"
+              DEBOOT_URL="http://archive.debian.org/debian"
+              sudo debootstrap --arch=armhf --foreign --variant=minbase stretch "${SYSROOT}" "${DEBOOT_URL}"
+              sudo cp /usr/bin/qemu-arm-static "${SYSROOT}/usr/bin/" || true
+              sudo mkdir -p "${SYSROOT}/etc/apt/apt.conf.d"
+              echo 'Acquire::Check-Valid-Until "false";' | sudo tee "${SYSROOT}/etc/apt/apt.conf.d/99no-check-valid-until" >/dev/null
+              printf '%s\n' "deb http://archive.debian.org/debian stretch main" "deb http://archive.debian.org/debian-security stretch/updates main" | sudo tee "${SYSROOT}/etc/apt/sources.list" >/dev/null
+              sudo mount --bind /proc "${SYSROOT}/proc" || true
+              sudo mount --bind /sys "${SYSROOT}/sys" || true
+              sudo mount --bind /dev "${SYSROOT}/dev" || true
+              sudo mount --bind /dev/pts "${SYSROOT}/dev/pts" || true
+
+              sudo chroot "${SYSROOT}" /usr/bin/qemu-arm-static /bin/bash -c '
+                set -euo pipefail
+                rm -rf /var/lib/apt/lists/* || true
+                /debootstrap/debootstrap --second-stage
+                apt-get -o Acquire::Check-Valid-Until=false update
+                apt-get -o Acquire::Check-Valid-Until=false install -y --no-install-recommends build-essential libc6-dev pkg-config ca-certificates
+                rm -rf /var/lib/apt/lists/* || true
+              '
+              sudo umount -l "${SYSROOT}/proc" || true
+              sudo umount -l "${SYSROOT}/sys" || true
+              sudo umount -l "${SYSROOT}/dev/pts" || true
+              sudo umount -l "${SYSROOT}/dev" || true
+              sudo chmod -R a+rX "${SYSROOT}"
+
+              export CC="arm-linux-gnueabihf-gcc --sysroot=${SYSROOT}"
+              export CXX="arm-linux-gnueabihf-g++ --sysroot=${SYSROOT}"
+              export CGO_ENABLED=1
+              export GOOS=linux
+              export GOARCH=arm
+              export GOARM=7
+              export CGO_CFLAGS="--sysroot=${SYSROOT}"
+              export CGO_LDFLAGS="--sysroot=${SYSROOT} -L${SYSROOT}/lib -L${SYSROOT}/usr/lib"
+
+              CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 \
+                go build -buildvcs=false -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
+                -o "${archive_dir}/cli-proxy-api" ./cmd/server/
+
+              cp LICENSE README.md README_CN.md config.example.yaml "$archive_dir/" || true
+              tar -C "$archive_dir" -czf "dist/${outname}" cli-proxy-api LICENSE README.md README_CN.md config.example.yaml || true
+              ;;
+
+            crosspkg-sysroot)
+              echo "crosspkg-sysroot build (distro cross packages)"
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf libc6-dev-armhf-cross
+              SYSROOT="/usr/arm-linux-gnueabihf"
+              export CC="arm-linux-gnueabihf-gcc --sysroot=${SYSROOT}"
+              export CXX="arm-linux-gnueabihf-g++ --sysroot=${SYSROOT}"
+              export CGO_ENABLED=1
+              export GOOS=linux
+              export GOARCH=arm
+              export GOARM=7
+              export CGO_CFLAGS="--sysroot=${SYSROOT}"
+              export CGO_LDFLAGS="--sysroot=${SYSROOT} -L${SYSROOT}/lib -L${SYSROOT}/usr/lib"
+
+              CGO_ENABLED=1 GOOS=linux GOARCH=arm GOARM=7 \
+                go build -buildvcs=false -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
+                -o "${archive_dir}/cli-proxy-api" ./cmd/server/
+
+              cp LICENSE README.md README_CN.md config.example.yaml "$archive_dir/" || true
+              tar -C "$archive_dir" -czf "dist/${outname}" cli-proxy-api LICENSE README.md README_CN.md config.example.yaml || true
+              ;;
+
+            static-fallback)
+              echo "static-fallback build (CGO disabled)"
+              CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 \
+                go build -buildvcs=false -ldflags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" \
+                -o "${archive_dir}/cli-proxy-api" ./cmd/server/
+              cp LICENSE README.md README_CN.md config.example.yaml "$archive_dir/" || true
+              tar -C "$archive_dir" -czf "dist/${outname}" cli-proxy-api LICENSE README.md README_CN.md config.example.yaml || true
+              ;;
+
+            *)
+              echo "unknown method ${METHOD}" >&2
+              exit 1
+              ;;
+          esac
+
+          BINPATH="${archive_dir}/cli-proxy-api"
+          if [[ -f "${BINPATH}" ]]; then
+            if ! check_glibc_and_maybe_fail "${BINPATH}"; then
+              echo "GLIBC check flagged method ${METHOD}; artifact retained for inspection." >&2
+            fi
+          else
+            echo "No binary produced by method ${METHOD}; check job logs." >&2
+          fi
+
+      - name: Upload armv7 artifact for ${{ matrix.method }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: armv7-${{ matrix.method }}
+          path: dist/linux-armv7/${{ matrix.method }}/
+          if-no-files-found: warn
+
+  # build-linux-no-plugin and build-freebsd commented per request (omitted)
 
   publish-checksums:
     runs-on: ubuntu-latest
     if: always()
     needs:
       - build-linux-glibc
+      - build-armv7-parallel
     steps:
       - uses: actions/download-artifact@v4
         with:
